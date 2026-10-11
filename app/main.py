@@ -1094,9 +1094,3 @@ def explain_endpoint(
     )
     explain = db.command("explain", spec["command"], verbosity="executionStats")
     return {"endpoint": endpoint, "collection": spec["collection"], "explain": explain}
-
-
-# --------------------------------------------------------------------------- #
-# TODO - the rest of the contract (see openapi.yaml):
-#   README / DECISIONS finalization
-# --------------------------------------------------------------------------- #
