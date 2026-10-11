@@ -25,5 +25,3 @@
 | 21 | `list_attendance` | Sort order was only date descending, not date descending then emp_code ascending. | Same-date records could return nondeterministically. | Added compound sort `[("date", DESCENDING), ("emp_code", ASCENDING)]`. |
 | 22 | `list_attendance` | `date_from > date_to` was not rejected. | `GET /attendance?date_from=2026-07-10&date_to=2026-07-01` returned an empty page instead of 422. | Added explicit range validation. |
 | 23 | Serialization | Missing legacy fields such as `history` and `half_day` were not normalized. | Legacy sample records could omit required API fields. | Serialize missing `history` as `[]` and `half_day` as `false`. |
-
-I looked at keeping all code in `app/main.py`; although the file will become large, the assignment explicitly requires it, so I did not split modules.
