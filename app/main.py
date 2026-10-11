@@ -26,6 +26,8 @@ EPOCH_MIN = 100_000_000_000
 EPOCH_MAX = 4_102_444_800_000
 PRESENCE_STATUSES = {"PRESENT", "WFH", "ON_DUTY"}
 ALL_STATUSES = PRESENCE_STATUSES | {"ABSENT", "LEAVE"}
+PRESENCE_STATUS_LIST = sorted(PRESENCE_STATUSES)
+WEEKDAY_NUMBERS = [2, 3, 4, 5, 6]
 TIME_RE = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 MONTH_RE = re.compile(r"^\d{4}-(0[1-9]|1[0-2])$")
@@ -185,37 +187,38 @@ def normalize_attendance_base(doc: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def finalize_attendance_values(record: dict[str, Any], emp: dict[str, Any]) -> dict[str, Any]:
-    status = record["status"]
-    if status not in ALL_STATUSES:
-        raise HTTPException(422, "invalid status")
-    values = normalize_attendance_base(record)
-    values["status"] = status
-    if status not in PRESENCE_STATUSES:
-        values.update(
-            {
-                "punch_in": None,
-                "punch_out": None,
-                "work_hours": None,
-                "late_minutes": 0,
-                "overtime_minutes": 0,
-                "half_day": False,
-            }
-        )
-        return values
+def clear_absence_fields(values: dict[str, Any]) -> dict[str, Any]:
+    values.update(
+        {
+            "punch_in": None,
+            "punch_out": None,
+            "work_hours": None,
+            "late_minutes": 0,
+            "overtime_minutes": 0,
+            "half_day": False,
+        }
+    )
+    return values
 
+
+def recompute_presence_fields(values: dict[str, Any], emp: dict[str, Any]) -> dict[str, Any]:
     punch_in = values.get("punch_in")
     if punch_in is None:
         raise HTTPException(422, "presence status requires punch_in")
+
     punch_in = ensure_utc(punch_in).replace(microsecond=0)
     punch_out = values.get("punch_out")
     punch_out = ensure_utc(punch_out).replace(microsecond=0) if punch_out is not None else None
+
+    # R1: a corrected punch-in must still belong to this record's IST attendance date.
     if attendance_date_for(punch_in, emp["shift_start"], emp["shift_end"]) != values["date"]:
         raise HTTPException(422, "punch_in must stay on the record attendance date")
+
     validate_punch_window(punch_in, punch_out)
     values["punch_in"] = punch_in
     values["punch_out"] = punch_out
     values["late_minutes"] = compute_late_minutes(punch_in, emp["shift_start"], values["date"])
+
     if punch_out is None:
         values["work_hours"] = None
         values["overtime_minutes"] = 0
@@ -231,6 +234,18 @@ def finalize_attendance_values(record: dict[str, Any], emp: dict[str, Any]) -> d
         )
         values["half_day"] = work_hours < 4.5
     return values
+
+
+def finalize_attendance_values(record: dict[str, Any], emp: dict[str, Any]) -> dict[str, Any]:
+    status = record["status"]
+    if status not in ALL_STATUSES:
+        raise HTTPException(422, "invalid status")
+
+    values = normalize_attendance_base(record)
+    values["status"] = status
+    if status in {"ABSENT", "LEAVE"}:
+        return clear_absence_fields(values)
+    return recompute_presence_fields(values, emp)
 
 
 def values_match(left: Any, right: Any) -> bool:
@@ -384,18 +399,39 @@ def date_string_expr(field: str) -> dict[str, Any]:
 
 
 def weekday_expr(date_field: str) -> dict[str, Any]:
-    return {"$in": [{"$dayOfWeek": {"$dateFromString": {"dateString": date_field}}}, [2, 3, 4, 5, 6]]}
+    return {"$in": [{"$dayOfWeek": {"$dateFromString": {"dateString": date_field}}}, WEEKDAY_NUMBERS]}
 
 
 def present_day_expr(status_field: str, half_day_field: str, *, working_day: Optional[Any] = None) -> dict[str, Any]:
-    conditions: list[Any] = [{"$in": [status_field, sorted(PRESENCE_STATUSES)]}]
+    conditions: list[Any] = [{"$in": [status_field, PRESENCE_STATUS_LIST]}]
     if working_day is not None:
         conditions.append(working_day)
     return {"$cond": [{"$and": conditions}, {"$cond": [{"$ifNull": [half_day_field, False]}, 0.5, 1]}, 0]}
 
 
+def present_completed_work_expr(status_field: str, work_hours_field: str) -> dict[str, Any]:
+    return {
+        "$and": [
+            {"$in": [status_field, PRESENCE_STATUS_LIST]},
+            {"$ne": [work_hours_field, None]},
+        ]
+    }
+
+
+def count_if(condition: Any) -> dict[str, Any]:
+    return {"$sum": {"$cond": [condition, 1, 0]}}
+
+
+def sum_minutes(field: str) -> dict[str, Any]:
+    return {"$sum": {"$ifNull": [field, 0]}}
+
+
 def aggregate_one(collection: Any, pipeline: list[dict[str, Any]]) -> dict[str, Any]:
     return next(iter(collection.aggregate(pipeline)), {})
+
+
+def aggregate_command(collection: str, pipeline: list[dict[str, Any]]) -> dict[str, Any]:
+    return {"aggregate": collection, "pipeline": pipeline, "cursor": {}}
 
 
 def ranked_late_rows(rows: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
@@ -413,6 +449,7 @@ def ranked_late_rows(rows: list[dict[str, Any]], limit: int) -> list[dict[str, A
 
 
 def employee_monthly_pipeline(emp_code: str, start: str, end: str) -> list[dict[str, Any]]:
+    has_late_minutes = {"$gt": [{"$ifNull": ["$late_minutes", 0]}, 0]}
     return [
         {"$match": {"emp_code": emp_code, "date": {"$gte": start, "$lte": end}}},
         {
@@ -421,10 +458,10 @@ def employee_monthly_pipeline(emp_code: str, start: str, end: str) -> list[dict[
                 "present_days": {
                     "$sum": present_day_expr("$status", "$half_day", working_day=weekday_expr("$date")),
                 },
-                "leave_days": {"$sum": {"$cond": [{"$eq": ["$status", "LEAVE"]}, 1, 0]}},
-                "late_count": {"$sum": {"$cond": [{"$gt": [{"$ifNull": ["$late_minutes", 0]}, 0]}, 1, 0]}},
-                "total_late_minutes": {"$sum": {"$ifNull": ["$late_minutes", 0]}},
-                "total_overtime_minutes": {"$sum": {"$ifNull": ["$overtime_minutes", 0]}},
+                "leave_days": count_if({"$eq": ["$status", "LEAVE"]}),
+                "late_count": count_if(has_late_minutes),
+                "total_late_minutes": sum_minutes("$late_minutes"),
+                "total_overtime_minutes": sum_minutes("$overtime_minutes"),
             }
         },
     ]
@@ -435,6 +472,8 @@ def department_summary_pipeline(month: str, department: Optional[str]) -> list[d
     employee_match: dict[str, Any] = {"joined_on": {"$lte": end}}
     if department:
         employee_match["department"] = department
+    completed_work = present_completed_work_expr("$logs.status", "$logs.work_hours")
+    has_late_minutes = {"$gt": [{"$ifNull": ["$logs.late_minutes", 0]}, 0]}
     return [
         {"$match": employee_match},
         {
@@ -466,37 +505,13 @@ def department_summary_pipeline(month: str, department: Optional[str]) -> list[d
                     "$sum": present_day_expr("$logs.status", "$logs.half_day", working_day="$logs.is_working_day"),
                 },
                 "total_work_hours": {
-                    "$sum": {
-                        "$cond": [
-                            {
-                                "$and": [
-                                    {"$in": ["$logs.status", sorted(PRESENCE_STATUSES)]},
-                                    {"$ne": ["$logs.work_hours", None]},
-                                ]
-                            },
-                            "$logs.work_hours",
-                            0,
-                        ]
-                    }
+                    "$sum": {"$cond": [completed_work, "$logs.work_hours", 0]}
                 },
-                "work_hours_count": {
-                    "$sum": {
-                        "$cond": [
-                            {
-                                "$and": [
-                                    {"$in": ["$logs.status", sorted(PRESENCE_STATUSES)]},
-                                    {"$ne": ["$logs.work_hours", None]},
-                                ]
-                            },
-                            1,
-                            0,
-                        ]
-                    }
-                },
-                "late_count": {"$sum": {"$cond": [{"$gt": [{"$ifNull": ["$logs.late_minutes", 0]}, 0]}, 1, 0]}},
-                "total_late_minutes": {"$sum": {"$ifNull": ["$logs.late_minutes", 0]}},
-                "leave_count": {"$sum": {"$cond": [{"$eq": ["$logs.status", "LEAVE"]}, 1, 0]}},
-                "on_duty_count": {"$sum": {"$cond": [{"$eq": ["$logs.status", "ON_DUTY"]}, 1, 0]}},
+                "work_hours_count": count_if(completed_work),
+                "late_count": count_if(has_late_minutes),
+                "total_late_minutes": sum_minutes("$logs.late_minutes"),
+                "leave_count": count_if({"$eq": ["$logs.status", "LEAVE"]}),
+                "on_duty_count": count_if({"$eq": ["$logs.status", "ON_DUTY"]}),
             }
         },
         {
@@ -559,6 +574,7 @@ def late_leaderboard_pipeline(month: str, department: Optional[str]) -> list[dic
 def department_trend_pipeline(department: str, start: str, end: str) -> list[dict[str, Any]]:
     day_count = len(trend_days(start, end))
     start_dt = datetime.combine(date.fromisoformat(start), time.min, tzinfo=timezone.utc)
+    has_late_minutes = {"$gt": [{"$ifNull": ["$late_minutes", 0]}, 0]}
     return [
         {"$match": {"department": department}},
         {"$limit": 1},
@@ -578,7 +594,7 @@ def department_trend_pipeline(department: str, start: str, end: str) -> list[dic
         {
             "$set": {
                 "date": date_string_expr("$date_obj"),
-                "is_working_day": {"$in": [{"$dayOfWeek": "$date_obj"}, [2, 3, 4, 5, 6]]},
+                "is_working_day": {"$in": [{"$dayOfWeek": "$date_obj"}, WEEKDAY_NUMBERS]},
             }
         },
         {
@@ -621,9 +637,7 @@ def department_trend_pipeline(department: str, start: str, end: str) -> list[dic
                         "$group": {
                             "_id": None,
                             "present_count": {"$sum": present_day_expr("$status", "$half_day")},
-                            "late_count": {
-                                "$sum": {"$cond": [{"$gt": [{"$ifNull": ["$late_minutes", 0]}, 0]}, 1, 0]}
-                            },
+                            "late_count": count_if(has_late_minutes),
                         }
                     },
                 ],
@@ -682,6 +696,10 @@ def require_explain_param(params: dict[str, Any], name: str) -> Any:
     return value
 
 
+def explain_spec(collection: str, command: dict[str, Any]) -> dict[str, Any]:
+    return {"collection": collection, "command": command}
+
+
 def build_explain_command(endpoint: str, params: dict[str, Any]) -> dict[str, Any]:
     if endpoint == "attendance_list":
         page = int(params.get("page", 1))
@@ -694,64 +712,48 @@ def build_explain_command(endpoint: str, params: dict[str, Any]) -> dict[str, An
             params.get("date_to"),
             params.get("status"),
         )
-        return {
-            "collection": "attendance_logs",
-            "command": {
+        return explain_spec(
+            "attendance_logs",
+            {
                 "find": "attendance_logs",
                 "filter": query,
                 "sort": {"date": -1, "emp_code": 1},
                 "skip": (page - 1) * page_size,
                 "limit": page_size,
             },
-        }
+        )
 
     if endpoint == "employee_monthly":
         emp_code = require_explain_param(params, "emp_code")
         month = require_explain_param(params, "month")
         start, end = month_bounds(month)
-        return {
-            "collection": "attendance_logs",
-            "command": {
-                "aggregate": "attendance_logs",
-                "pipeline": employee_monthly_pipeline(emp_code, start, end),
-                "cursor": {},
-            },
-        }
+        return explain_spec(
+            "attendance_logs",
+            aggregate_command("attendance_logs", employee_monthly_pipeline(emp_code, start, end)),
+        )
 
     if endpoint == "department_summary":
         month = require_explain_param(params, "month")
-        return {
-            "collection": "employees",
-            "command": {
-                "aggregate": "employees",
-                "pipeline": department_summary_pipeline(month, params.get("department")),
-                "cursor": {},
-            },
-        }
+        return explain_spec(
+            "employees",
+            aggregate_command("employees", department_summary_pipeline(month, params.get("department"))),
+        )
 
     if endpoint == "late_leaderboard":
         month = require_explain_param(params, "month")
-        return {
-            "collection": "attendance_logs",
-            "command": {
-                "aggregate": "attendance_logs",
-                "pipeline": late_leaderboard_pipeline(month, params.get("department")),
-                "cursor": {},
-            },
-        }
+        return explain_spec(
+            "attendance_logs",
+            aggregate_command("attendance_logs", late_leaderboard_pipeline(month, params.get("department"))),
+        )
 
     if endpoint == "department_trend":
         department = require_explain_param(params, "department")
         start = require_explain_param(params, "from")
         end = require_explain_param(params, "to")
-        return {
-            "collection": "employees",
-            "command": {
-                "aggregate": "employees",
-                "pipeline": department_trend_pipeline(department, start, end),
-                "cursor": {},
-            },
-        }
+        return explain_spec(
+            "employees",
+            aggregate_command("employees", department_trend_pipeline(department, start, end)),
+        )
 
     raise HTTPException(422, "unsupported endpoint")
 
