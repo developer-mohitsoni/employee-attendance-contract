@@ -1,9 +1,29 @@
 # REVIEW.md
 
-List every defect you found in the starter `app/main.py` (helpers and endpoints). For each one:
-
 | # | Where (function / line) | What is wrong | How you'd notice it (test, input, or symptom) | How you fixed it |
 |---|---|---|---|---|
-| 1 | | | | |
+| 1 | MongoClient setup | The client used PyMongo's default naive datetimes, making UTC conversion ambiguous at the API boundary. | A seeded BSON date could serialize differently depending on local assumptions. | Created the client with `tz_aware=True` and normalized datetimes to UTC when serializing. |
+| 2 | Startup | The starter created no indexes, so uniqueness and explain-plan requirements were not guaranteed. | Concurrent duplicate employees or punch-ins could both pass; explain could show collection scans. | Added idempotent startup indexes for employee codes, attendance natural keys, list filters, and punch-out lookup. |
+| 3 | `health` | Returned `{"status": "ok"}` without checking MongoDB. | The readiness probe would return 200 even if MongoDB was down. | Added a `ping` command and return 503 on failure. |
+| 4 | `create_employee` | Duplicate `emp_code` was checked before insert instead of enforced by a unique index. | Two concurrent creates could both pass the pre-check. | Insert directly and convert `DuplicateKeyError` to 409. |
+| 5 | `create_employee` | `created_at` used local naive `datetime.now()` and returned a datetime, not epoch milliseconds. | Response did not match the OpenAPI schema. | Store a UTC second-truncated datetime and serialize it as epoch milliseconds. |
+| 6 | `EmployeeIn` | Missing schema validation for employee code, email, dates, shift times, and identical shift start/end. | Invalid payloads such as `emp_code="1"` or equal shift times could be accepted. | Added Pydantic constraints and validators matching the contract. |
+| 7 | `list_employees` | Pagination used `skip = page * page_size`, skipping the first page of results. | `GET /employees?page=1&page_size=20` skipped the first 20 employees. | Changed to `(page - 1) * page_size`. |
+| 8 | `list_employees` | `total` counted all employees instead of the filtered set. | `department=Sales` could return `total` for every department. | Count using the same filter query as the list. |
+| 9 | `list_employees` | Results were not sorted by `emp_code`. | Hidden tests expecting deterministic order would fail. | Added `sort("emp_code", ASCENDING)`. |
+| 10 | `list_employees` / `list_attendance` | `page_size` had no maximum and `page` accepted invalid values. | `page=0` or huge `page_size` could return incorrect or slow responses. | Added FastAPI query validation for R10. |
+| 11 | `punch_in` | Unknown employees were not handled before reading `emp["shift_start"]`. | Punching in an unknown employee raised a 500 instead of 404. | Return 404 when the employee is missing. |
+| 12 | `punch_in` | `status` accepted any string, including `ABSENT` and invalid values. | A client could create an `ABSENT` record through punch-in. | Restricted punch-in status to `PRESENT`, `WFH`, or `ON_DUTY`. |
+| 13 | `punch_in` | Timestamp conversion used local time and did not enforce epoch milliseconds or whole-second truncation. | Seconds-looking values, strings, and timezone boundaries would produce wrong records. | Added strict epoch-ms validation and UTC second-truncation. |
+| 14 | `punch_in` | Attendance date was the server/local date, not the IST R1 date, and overnight shifts were ignored. | A 05:00 IST punch on an overnight shift would be stored under the wrong date. | Added IST attendance-date logic including overnight shift handling. |
+| 15 | `compute_late_minutes` | Late calculation replaced the punch timestamp's hour/minute directly, which breaks timezone handling and overnight dates. | Boundary examples like 09:40:01 IST were unreliable outside local IST. | Compute the shift start as an IST instant for the record date. |
+| 16 | `compute_work_hours` | Used Python `round`, which is banker's rounding, not half-up. | Durations exactly on a half-cent boundary can round the wrong way. | Switched to `Decimal` with `ROUND_HALF_UP`. |
+| 17 | `compute_overtime` | Returned any positive overtime, even under the 30-minute minimum, and ignored overnight shift end dates. | A 5-minute late departure returned overtime instead of 0. | Added whole-minute floor, 30-minute threshold, and overnight end handling. |
+| 18 | `punch_in` | Race safety relied on check-then-insert. | Two identical concurrent punch-ins could both create records. | Use the unique `(emp_code, date)` index and convert duplicate-key errors to 409. |
+| 19 | `punch_in` / `list_attendance` | Responses exposed internal ObjectIds as `id`, although attendance records have no API id. | Response shape differed from `AttendanceRecord`. | Removed `_id` and do not add `id`. |
+| 20 | `list_attendance` | Loaded all matching documents into memory and sorted/paginated in Python. | It would be slow on 100k records and could miss index usage. | Use MongoDB sort, skip, limit, and count. |
+| 21 | `list_attendance` | Sort order was only date descending, not date descending then emp_code ascending. | Same-date records could return nondeterministically. | Added compound sort `[("date", DESCENDING), ("emp_code", ASCENDING)]`. |
+| 22 | `list_attendance` | `date_from > date_to` was not rejected. | `GET /attendance?date_from=2026-07-10&date_to=2026-07-01` returned an empty page instead of 422. | Added explicit range validation. |
+| 23 | Serialization | Missing legacy fields such as `history` and `half_day` were not normalized. | Legacy sample records could omit required API fields. | Serialize missing `history` as `[]` and `half_day` as `false`. |
 
-Also note anything you looked at and decided was **not** a defect, and why.
+I looked at keeping all code in `app/main.py`; although the file will become large, the assignment explicitly requires it, so I did not split modules.
