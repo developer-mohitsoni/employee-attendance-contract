@@ -8,18 +8,10 @@ The app starts from the required entrypoint:
 uvicorn app.main:app --port 8000
 ```
 
-The code is split into small modules for readability:
+All application code is in:
 
 ```text
-app/main.py              FastAPI app setup and router registration
-app/database.py          Mongo client and indexes
-app/constants.py         Shared constants and validation regex
-app/schemas.py           Pydantic request models
-app/utils.py             Business rules, serializers, aggregation builders
-app/routes/employees.py  Employee endpoints
-app/routes/attendance.py Punch-in, punch-out, regularization endpoints
-app/routes/analytics.py  Analytics endpoints
-app/routes/admin.py      Explain endpoint
+app/main.py
 ```
 
 ## Setup
@@ -46,14 +38,6 @@ $env:MONGO_DB="attendance_db"
 
 MongoDB 6.0+ is required.
 
-## Seed Sample Data
-
-```bash
-python sample_seed.py
-```
-
-This loads the sample employees and attendance logs from `sample_data/`.
-
 ## Run
 
 ```bash
@@ -69,8 +53,8 @@ curl http://localhost:8000/health
 ## Test
 
 ```bash
-python -m unittest discover -v
-python -m py_compile app\main.py app\constants.py app\database.py app\schemas.py app\utils.py app\routes\employees.py app\routes\attendance.py app\routes\analytics.py app\routes\admin.py
+python -m py_compile app\main.py
+python -c "from app.main import app; print(len(app.openapi()['paths']))"
 ```
 
 ## Implemented
