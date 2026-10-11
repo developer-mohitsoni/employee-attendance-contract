@@ -3,7 +3,7 @@ from decimal import Decimal
 
 from fastapi import HTTPException
 
-from app.main import month_bounds, ranked_late_rows, round_report, trend_days, working_days_between
+from app.utils import month_bounds, ranked_late_rows, round_report, trend_days, working_days_between
 
 
 class PhaseThreeAnalyticsTests(unittest.TestCase):

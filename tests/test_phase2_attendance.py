@@ -3,7 +3,7 @@ from datetime import datetime, timezone
 
 from fastapi import HTTPException
 
-from app.main import build_regularization_update, finalize_attendance_values
+from app.utils import build_regularization_update, finalize_attendance_values
 
 
 EMPLOYEE = {

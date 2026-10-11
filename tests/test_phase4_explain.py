@@ -2,7 +2,7 @@ import unittest
 
 from fastapi import HTTPException
 
-from app.main import build_explain_command
+from app.utils import build_explain_command
 
 
 class PhaseFourExplainTests(unittest.TestCase):

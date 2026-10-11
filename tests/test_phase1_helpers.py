@@ -1,7 +1,7 @@
 import unittest
 from datetime import datetime, timezone
 
-from app.main import (
+from app.utils import (
     attendance_date_for,
     compute_late_minutes,
     compute_overtime_minutes,
