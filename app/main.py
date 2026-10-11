@@ -675,6 +675,87 @@ def department_trend_pipeline(department: str, start: str, end: str) -> list[dic
     ]
 
 
+def require_explain_param(params: dict[str, Any], name: str) -> Any:
+    value = params.get(name)
+    if value in (None, ""):
+        raise HTTPException(422, f"{name} is required")
+    return value
+
+
+def build_explain_command(endpoint: str, params: dict[str, Any]) -> dict[str, Any]:
+    if endpoint == "attendance_list":
+        page = int(params.get("page", 1))
+        page_size = int(params.get("page_size", 20))
+        if page < 1 or page_size < 1 or page_size > 100:
+            raise HTTPException(422, "invalid pagination")
+        query = build_attendance_query(
+            params.get("emp_code"),
+            params.get("date_from"),
+            params.get("date_to"),
+            params.get("status"),
+        )
+        return {
+            "collection": "attendance_logs",
+            "command": {
+                "find": "attendance_logs",
+                "filter": query,
+                "sort": {"date": -1, "emp_code": 1},
+                "skip": (page - 1) * page_size,
+                "limit": page_size,
+            },
+        }
+
+    if endpoint == "employee_monthly":
+        emp_code = require_explain_param(params, "emp_code")
+        month = require_explain_param(params, "month")
+        start, end = month_bounds(month)
+        return {
+            "collection": "attendance_logs",
+            "command": {
+                "aggregate": "attendance_logs",
+                "pipeline": employee_monthly_pipeline(emp_code, start, end),
+                "cursor": {},
+            },
+        }
+
+    if endpoint == "department_summary":
+        month = require_explain_param(params, "month")
+        return {
+            "collection": "employees",
+            "command": {
+                "aggregate": "employees",
+                "pipeline": department_summary_pipeline(month, params.get("department")),
+                "cursor": {},
+            },
+        }
+
+    if endpoint == "late_leaderboard":
+        month = require_explain_param(params, "month")
+        return {
+            "collection": "attendance_logs",
+            "command": {
+                "aggregate": "attendance_logs",
+                "pipeline": late_leaderboard_pipeline(month, params.get("department")),
+                "cursor": {},
+            },
+        }
+
+    if endpoint == "department_trend":
+        department = require_explain_param(params, "department")
+        start = require_explain_param(params, "from")
+        end = require_explain_param(params, "to")
+        return {
+            "collection": "employees",
+            "command": {
+                "aggregate": "employees",
+                "pipeline": department_trend_pipeline(department, start, end),
+                "cursor": {},
+            },
+        }
+
+    raise HTTPException(422, "unsupported endpoint")
+
+
 # --------------------------------------------------------------------------- #
 # Models
 # --------------------------------------------------------------------------- #
@@ -978,7 +1059,42 @@ def department_trend(
     return {"department": department, "items": rows}
 
 
+@app.get("/admin/explain/{endpoint}")
+def explain_endpoint(
+    endpoint: Literal["attendance_list", "employee_monthly", "department_summary", "late_leaderboard", "department_trend"],
+    emp_code: Optional[str] = None,
+    month: Optional[str] = Query(None, pattern=r"^\d{4}-(0[1-9]|1[0-2])$"),
+    department: Optional[str] = None,
+    limit: Annotated[int, Query(ge=1, le=50)] = 10,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    status: Optional[Literal["PRESENT", "ABSENT", "LEAVE", "WFH", "ON_DUTY"]] = None,
+    from_date: Optional[str] = Query(None, alias="from"),
+    to: Optional[str] = None,
+    page: Page = 1,
+    page_size: PageSize = 20,
+):
+    spec = build_explain_command(
+        endpoint,
+        {
+            "emp_code": emp_code,
+            "month": month,
+            "department": department,
+            "limit": limit,
+            "date_from": date_from,
+            "date_to": date_to,
+            "status": status,
+            "from": from_date,
+            "to": to,
+            "page": page,
+            "page_size": page_size,
+        },
+    )
+    explain = db.command("explain", spec["command"], verbosity="executionStats")
+    return {"endpoint": endpoint, "collection": spec["collection"], "explain": explain}
+
+
 # --------------------------------------------------------------------------- #
 # TODO - the rest of the contract (see openapi.yaml):
-#   GET   /admin/explain/{endpoint}
+#   README / DECISIONS finalization
 # --------------------------------------------------------------------------- #
